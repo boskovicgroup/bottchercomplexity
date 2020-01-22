@@ -1,0 +1,28 @@
+version: v1.0
+name: Initial Pipeline
+agent:
+  machine:
+    type: e1-standard-2
+    os_image: ubuntu1804
+blocks:
+  - name: Get Anaconda
+    task:
+      jobs:
+        - name: 'Job #1'
+          commands:
+            - >-
+              git clone
+              http://www.github.com/boskovicgroup/bottchercomplexity.git
+            - cd bottchercomplexity
+      prologue:
+        commands:
+          - >-
+            curl -O
+            https://repo.anaconda.com/archive/Anaconda3-2019.03-Linux-x86_64.sh
+          - bash Anaconda3-2019.03-Linux-x86_64.sh -b
+          - source ~/anaconda3/bin/activate
+          - conda init
+          - source ~/.bashrc
+          - echo y | conda update -n base -c defaults conda
+          - echo y | conda create -c rdkit -n my-rdkit-env rdkit
+          - conda activate my-rdkit-env
