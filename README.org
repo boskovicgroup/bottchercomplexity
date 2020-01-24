@@ -1,0 +1,265 @@
+[[https://github.com/boskovicgroup/bottchercomplexity][https://boskovicgroup.semaphoreci.com/badges/bottchercomplexity/branches/set-up-semaphore.svg]]
+
+* A new module for computing chemical complexity in RDKit
+Available in both Jupyter and standalone module form, this module leverages [[https://github.com/rdkit/rdkit][RDKit]] to calculate molecular
+complexity according to Dr. Böttcher's complexity equation as elucidated in [[https://pubs.acs.org/doi/abs/10.1021/acs.jcim.5b00723][this paper]] (also linked in
+the repo description).
+
+In this README, we will attempt to clarify the meaning of the code and explain our design choices to
+make this package as extensible as possible. We have written it in Emacs's Org mode format to allow
+for a literate programming approach.
+
+To start, our dependencies are listed below. The majority are to allow us to
+import a package called ChiralDescriptors from the RDKit contrib folder, which
+houses user scripts that are released with but not part of the official package.
+
+#+begin_src python
+from __future__ import print_function
+import importlib.util
+import math
+import os
+import sys
+import numpy as np
+
+from collections import defaultdict
+from rdkit import Chem
+
+# If you don't want to draw your molecule these aren't necessary
+from rdkit.Chem import Draw
+from rdkit.Chem.Draw import DrawingOptions
+from rdkit.Chem.Draw import IPythonConsole
+
+from rdkit.Chem import AllChem
+from rdkit.Chem import RDConfig
+sys.path.append(os.path.join(RDConfig.RDContribDir,'ChiralPairs'))
+from ChiralDescriptors import determineAtomSubstituents
+#+end_src
+
+Now that the imports are out of the way, we have to start defining functions to
+compute each parameter of the Bottcher equation.
+
+We can define these in any order as long as they are all declared before we try
+to compute complexity, but we may as well start with D: the number of chemically
+nonequivalent substituents attached to an atom. This is the function which makes
+use of the ChiralDescriptors module.
+
+** Parameters
+*** d
+#+begin_src python
+# TODO: Implement logic to determine e.g. whether repeats of CCCCC are cyclopentyl and pentyl or two of either
+def GetChemicalNonequivsNew(atom, themol):
+    num_unique_substituents = 0
+    # 8 should do; I don't know of an atom with more bonds than Rhenium in [Re_{2}Cl_{8}]^{2-}
+    substituents = [[],[],[],[],[],[],[],[]]
+    substituents_just_atom_labels = [[],[],[],[],[],[],[],[]]
+    for item,key in enumerate(ChiralDescriptors.determineAtomSubstituents(atom.GetIdx(), themol, Chem.GetDistanceMatrix(themol))[0]):
+        for subatom in ChiralDescriptors.determineAtomSubstituents(atom.GetIdx(), themol, Chem.GetDistanceMatrix(themol))[0][key]:
+            substituents[item].append(themol.GetAtomWithIdx(subatom))
+            substituents_just_atom_labels[item].append(themol.GetAtomWithIdx(subatom).GetSymbol())
+    # At this point in the program we have the four-membered list of substituents.
+    # If the chains are of different lengths then it is impossible for them to be chemically equivalent.
+    # Therefore, our first hack will be to check the number of unique substituents and their lengths against each other.
+    # But let's rearrange the list so that we have only the substituents that actually exist -- the rest are hydrogen.
+    num_unique_substituents = len(set(tuple(tuple(substituent) for substituent in substituents_just_atom_labels if substituent)))
+    return num_unique_substituents
+#+end_src
+*** e
+This parameter represents the number of different non-hydrogen elements or isotopes
+(including deuterium and tritium) in the atom's microenvironment, including the atom
+itself. For example, the value of e for the carbon of methane is 1, and the value of
+e for the carbon of formamide is 3, while both heteroatoms have e_i = 2.
+#+begin_src python
+def GetBottcherLocalDiversity(atom):
+    neighbors = []
+    for neighbor in atom.GetNeighbors():
+        neighbors.append(str(neighbor.GetSymbol()))
+    if atom.GetSymbol() in set(neighbors):
+        return len(set(neighbors))
+    else:
+        return len(set(neighbors))+1
+#+end_src
+
+*** s
+S is the number of isomerizations possible at a given atom. RDKit can tag these atoms
+with a parameter called CIPCode, so we only need to probe whether the atom has one
+or not.
+#+begin_src python
+def GetNumIsomericPossibilities(atom):
+    try:
+        if(atom.GetProp('_CIPCode')):
+            return 2
+    except:
+        return 1
+#+end_src
+
+*** V
+V represents the number of valence electrons an atom would have if it were both unbound
+and neutral. This is a dictionary's natural place.
+#+begin_src python
+def GetNumValenceElectrons(atom):
+    valence = {1: ['H', 'Li', 'Na', 'K', 'Rb', 'Cs', 'Fr'], # Alkali Metals
+               2: ['Be', 'Mg', 'Ca', 'Sr', 'Ba', 'Ra'], # Alkali Earth Metals
+               #transition metals???
+               3: ['B', 'Al', 'Ga', 'In', 'Tl', 'Nh'], #
+               4: ['C', 'Si', 'Ge', 'Sn', 'Pb', 'Fl'],
+               5: ['N', 'P', 'As', 'Sb', 'Bi', 'Mc'], # Pnictogens
+               6: ['O', 'S', 'Se', 'Te', 'Po', 'Lv'], # Chalcogens
+               7: ['F', 'Cl', 'Br', 'I', 'At', 'Ts'], # Halogens
+               8: ['He', 'Ne', 'Ar', 'Kr', 'Xe', 'Rn', 'Og']} # Noble Gases
+    for k in valence:
+        if atom.GetSymbol() in valence[k]:
+            return k
+    return 0
+#+end_src
+
+*** b
+B is representative of the total number of bonds to other atoms that have V*b > 1 (essentially,
+bonds to atoms other than hydrogen). Here, we can leverage the fact that RDKit does not typically
+report hydrogens to loop over the bonds an atom has. Later, this will be generalized to account for
+bonds to hydrogen.
+#+begin_src python
+def GetBottcherBondIndex(atom):
+    b_sub_i_ranking = 0
+    bonds = []
+    for bond in atom.GetBonds():
+        bonds.append(str(bond.GetBondType()))
+    for bond in bonds:
+        if bond == 'SINGLE':
+            b_sub_i_ranking += 1
+        if bond == 'DOUBLE':
+            b_sub_i_ranking += 2
+        if bond == 'TRIPLE':
+            b_sub_i_ranking += 3
+#+end_src
+There is a small hiccup, which is that if an atom is in an aromatic ring, then RDKit will not
+report the individual bonds that make the environment aromatic. For example, listing the bonds
+of a carbon in benzene does not return SINGLE, DOUBLE but just AROMATIC, so we must manually
+compensate for this for atoms that can participate in such bonding. In the future, a dictionary
+will be used for this instead of an if statement.
+#+begin_src python
+    if 'AROMATIC' in bonds:
+        # This list can be expanded as errors arise.
+        if atom.GetSymbol() == 'C':
+            b_sub_i_ranking += 3
+        elif atom.GetSymbol() == 'N' or atom.GetSymbol() == 'S':
+            b_sub_i_ranking += 2
+    return b_sub_i_ranking
+#+end_src
+
+** Utility Functions
+*** Determining which atoms must be computed
+There are a couple of differences between how RDKit determines symmetry and how the paper
+determines symmetry, the most obvious of which is in Benzene. Since all the carbons of
+benzene are chemically identical, they all get the same CIPRank as far as RDKit is concerned;
+however, in the paper, half of the atoms are considered for complexity calculations.
+
+This means that we not only need to know when two atoms have the same CIPRank, but how many
+atoms in total have that CIPRank, since for every two atoms we need to calculate the full
+value of the equation for one of them, and if there are an odd number of atoms with that
+same CIPRank, we have to compute half the value of the equation for the last one.
+#+begin_src python
+def remove_values_from_list(the_list, val):
+   return [value for value in the_list if value != val]
+
+def GetTheAtoms(themol, symmetries, halflings=False):
+    # We need to see what the count is for each CIPCode and adjust
+    # Say our count of _CIPCode 0 is six, then we need to append that atom
+    # to compute_full_complexity three times.
+    # If it is five, we need to append to compute_full_complexity twice and
+    # compute_half_complexity once.
+    # In both cases, we need to remove their CIPCode frem the list of CIPcodes
+    # so that no other atom with that CIPCode gets counted.
+    # We leverage the fact that each atom with the same CIPCode is by def. the
+    # same to accomplish this.
+    compute_full_complexity = []
+    compute_half_complexity = []
+    for atom in themol.GetAtoms():
+        number_of_occurrences = symmetries.count(atom.GetProp('_CIPRank'))
+        if number_of_occurrences == 1 :
+            compute_full_complexity.append(atom)
+            continue;
+        else:
+            number_of_times_full = number_of_occurrences // 2;
+            number_of_times_half = number_of_occurrences % 2;
+            for i in range(0,number_of_times_full):
+                compute_full_complexity.append(atom)
+            for i in range(0,number_of_times_half):
+                compute_half_complexity.append(atom)
+            symmetries = remove_values_from_list(symmetries, atom.GetProp('_CIPRank'))
+            continue;
+
+    if halflings:
+        return compute_half_complexity
+    else:
+        return compute_full_complexity
+#+end_src
+*** Debugging
+If you are having trouble getting the script to match calculations you have done by hand,
+you can turn on the debugging flag and see which atoms are under consideration and the
+values for all parameters attached to them. If you do end up modifying the script to
+correct that molecule, we would appreciate if you would both run the test suite with your
+change to ensure that it is not a breaking change, and submit a pull request to improve
+the accuracy of the script for everyone else if those tests pass. Currently, not every
+tested molecule /is/ passing, so the priority is in ensuring that either the same number
+of test cases pass, or more of them pass.
+#+begin_src python
+def PrintDebugInfo(symbol, symmetry, d_i, e_i, s_i, V_i, b_i):
+    print(symbol)
+    print('\tSymmetry Class: ' + symmetry)
+    #print('\tNeighbors: ')
+    #print('\tBonds: ')
+    print('\tCurrent Parameter Values:')
+    print('\t\td_sub_i: ' + str(d_i))
+    print('\t\te_sub_i: ' + str(e_i))
+    print('\t\ts_sub_i: ' + str(s_i))
+    print('\t\tV_sub_i: ' + str(V_i))
+    print('\t\tb_sub_i: ' + str(b_i))
+#+end_src
+** Putting it all together
+
+We've now explained all the elements that go into making the following function work.
+First, we take the molecule and assign CIPRanks to every atom in the molecule, so that
+we can determine how many times we should consider each atom. Then, we simply compute
+each parameter individually before adding them to the complexity index. If the debugging
+flag is turned on, then we'll also print out information about each atom as we pass it
+by. At the end, we return a float representing the complexity.
+
+#+begin_src python
+def GetBottcherComplexity(themol,debug=False):
+    complexity = 0
+    ## Assign CIPCodes to each atom in the molecule
+    Chem.AssignStereochemistry(themol,cleanIt=True,force=True,flagPossibleStereoCenters=True)
+    ## Append each atom's CIPCode to a list
+    CIPCodes = []
+    for atom in themol.GetAtoms():
+        CIPCodes.append(atom.GetProp('_CIPRank'))
+    atoms = GetTheAtoms(themol, CIPCodes)
+    half_atoms = GetTheAtoms(themol, CIPCodes, True)
+    if debug:
+        print("FULL ATOMS")
+    for atom in atoms:
+        d = GetChemicalNonequivsNew(atom, themol)
+        e = GetBottcherLocalDiversity(atom)
+        s = GetNumIsomericPossibilities(atom)
+        V = GetNumValenceElectrons(atom)
+        b = GetBottcherBondIndex(atom)
+        complexity += d*e*s*math.log(V*b,2)
+        if debug:
+            PrintDebugInfo(str(atom.GetSymbol()), str(atom.GetProp('_CIPRank')), d, e, s, V, b)
+    if half_atoms:
+        if debug:
+            print("HALF ATOMS")
+        for atom in half_atoms:
+            d = GetChemicalNonequivsNew(atom, themol)
+            e = GetBottcherLocalDiversity(atom)
+            s = GetNumIsomericPossibilities(atom)
+            V = GetNumValenceElectrons(atom)
+            b = GetBottcherBondIndex(atom)
+            complexity += (d*e*s*math.log(V*b,2)/2)
+            if debug:
+                PrintDebugInfo(str(atom.GetSymbol()), str(atom.GetProp('_CIPRank')), d, e, s, V, b)
+    if debug:
+        print('Current Complexity Score: ' + str(complexity))
+        return
+    return complexity
+#+end_src
